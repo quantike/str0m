@@ -49,11 +49,20 @@ impl Pacer for NullPacer {
 
     fn poll_queue(&mut self) -> Option<(MidRid, Option<TwccClusterId>)> {
         // Pick a queue using round robin, prioritize the least recently sent on queue.
+        // Ties break by MidRid: the snapshot order follows the caller's stream
+        // storage, a HashMap with a per-process random iteration order, and must
+        // not decide which queue a packet leaves first.
         let queue = self
             .queue_states
             .iter_mut()
             .filter(|q| q.snapshot.packet_count > 0)
-            .min_by_key(|q| self.last_sends.get(&q.midrid))?;
+            .min_by_key(|q| {
+                (
+                    self.last_sends.get(&q.midrid).copied(),
+                    q.midrid.0,
+                    q.midrid.1,
+                )
+            })?;
 
         queue.snapshot.packet_count -= 1;
         self.unsent_since = Some(queue.snapshot.created_at);
@@ -137,5 +146,21 @@ mod test {
         );
 
         assert_eq!(pacer.poll_queue(), Some((MidRid("a".into(), None), None)));
+    }
+
+    /// Queues never sent on tie on the absent last-send instant. The pick
+    /// must follow MidRid order, not the order of the queue snapshot.
+    #[test]
+    fn never_sent_queues_poll_in_midrid_order() {
+        let now = Instant::now();
+
+        let run = |mids: [&'static str; 2]| {
+            let mut pacer = NullPacer::default();
+            pacer.handle_timeout(now, mids.map(|mid| queue(mid, 1, now)).into_iter());
+            pacer.poll_queue().map(|(midrid, _)| midrid)
+        };
+
+        assert_eq!(run(["b", "a"]), run(["a", "b"]));
+        assert_eq!(run(["b", "a"]).unwrap().mid(), "a".into());
     }
 }
