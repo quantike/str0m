@@ -249,14 +249,25 @@ impl LeakyBucketPacer {
     }
 
     fn next_poll(&self, now: Instant) -> Option<((Instant, PacerReason), Option<&QueueState>)> {
-        // If we have never sent before, do so immediately on an arbitrary non-empty queue.
+        // The queue_states snapshot arrives in the caller's stream storage order,
+        // a HashMap with a per-process random iteration order (HashDoS protection,
+        // keyed by attacker-controlled SSRCs). Every selection below therefore
+        // ends in the queue identity, so equal-priority ties resolve the same way
+        // within a process and across processes.
+        //
+        // The canonical tie-break key is the queue's MidRid: (Mid, Option<Rid>)
+        // compared by byte order. It is the pacer's own queue identity and is
+        // unique among the queues of one snapshot.
+        // If we have never sent before, do so immediately on the non-empty queue
+        // with the lowest MidRid.
         if self.last_emitted.is_none() {
-            let mut queues = self
+            let first_non_empty = self
                 .queue_states
                 .iter()
-                .filter(|q| q.snapshot.packet_count > 0);
+                .filter(|q| q.snapshot.packet_count > 0)
+                .min_by_key(|q| (q.midrid.0, q.midrid.1));
 
-            if let Some(queue) = queues.next() {
+            if let Some(queue) = first_non_empty {
                 return Some(((now, PacerReason::FirstEver), Some(queue)));
             }
         };
@@ -266,7 +277,7 @@ impl LeakyBucketPacer {
             .iter()
             .filter(|qs| qs.unpaced)
             .filter_map(|qs| qs.snapshot.first_unsent.map(|t| (t, qs)))
-            .min_by_key(|(t, _)| *t);
+            .min_by_key(|(t, qs)| (*t, qs.midrid.0, qs.midrid.1));
 
         // Unpaced packets (such as audio by default) are sent immediately.
         if let Some((queued_at, qs)) = unpaced {
@@ -280,8 +291,15 @@ impl LeakyBucketPacer {
                 .filter(|q| q.snapshot.packet_count > 0);
 
             // Send on the non-empty queue with the lowest priority that, was least recently
-            // sent on.
-            non_empty_queues.min_by_key(|q| (q.snapshot.priority, q.snapshot.last_emitted))
+            // sent on, ties broken by queue identity.
+            non_empty_queues.min_by_key(|q| {
+                (
+                    q.snapshot.priority,
+                    q.snapshot.last_emitted,
+                    q.midrid.0,
+                    q.midrid.1,
+                )
+            })
         };
 
         if let Some(queue) = non_empty_queue {
@@ -409,12 +427,13 @@ impl LeakyBucketPacer {
             return None;
         }
 
-        // We must have a queue that supports padding.
+        // We must have a queue that supports padding. Ties on last_emitted
+        // break by queue identity.
         let maybe_queue = self
             .queue_states
             .iter()
             .filter(|q| q.use_for_padding)
-            .max_by_key(|q| q.snapshot.last_emitted);
+            .max_by_key(|q| (q.snapshot.last_emitted, q.midrid.0, q.midrid.1));
 
         if maybe_queue.is_none() {
             // No padding queue, no probes.
@@ -1032,6 +1051,45 @@ mod test {
         assert!(QueuePriority::Media < QueuePriority::Padding);
         assert!(QueuePriority::Media < QueuePriority::Empty);
         assert!(QueuePriority::Padding < QueuePriority::Empty);
+    }
+
+    /// Two queues tied on (priority, last_emitted) must poll in MidRid order
+    /// regardless of the order the queue snapshot arrives in.
+    #[test]
+    fn test_equal_priority_queues_poll_in_midrid_order() {
+        let now = Instant::now();
+
+        let make_state = |mid: &'static str| QueueState {
+            midrid: MidRid(Mid::from(mid), None),
+            unpaced: false,
+            use_for_padding: false,
+            snapshot: QueueSnapshot {
+                created_at: now,
+                byte_size: 10_usize,
+                packet_count: 1,
+                total_queue_time_origin: duration_ms(1),
+                last_emitted: Some(now),
+                first_unsent: None,
+                priority: QueuePriority::Media,
+            },
+        };
+
+        let run = |mids: [&'static str; 2]| {
+            let queues = mids.map(make_state);
+            let mut pacer = LeakyBucketPacer::new(Bitrate::kbps(300));
+            pacer.register_send(now, DataSize::bytes(100), MidRid(Mid::from("000"), None));
+            // Prime adjusted_bitrate, then advance far enough to clear the debt
+            // so the poll lands immediately.
+            pacer.handle_timeout(now, queues.into_iter());
+            pacer.handle_timeout(now + duration_ms(5), queues.into_iter());
+            pacer.poll_queue().map(|(midrid, _)| midrid)
+        };
+
+        let low_first = run(["b", "a"]);
+        let high_first = run(["a", "b"]);
+
+        assert_eq!(low_first, high_first);
+        assert_eq!(low_first.unwrap().mid(), Mid::from("a"));
     }
 
     fn assert_poll_success<F>(

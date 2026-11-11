@@ -133,7 +133,7 @@ str_id!(Mid, "Mid", 16, 3);
 ///
 /// In SDP this is an optional value that will be seen in [`MediaData`][crate::media::MediaData]
 /// if the remote peer is configured for simulcast.
-#[derive(Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub struct Rid([u8; 8]);
 str_id!(Rid, "Rid", 8, 3);
 
