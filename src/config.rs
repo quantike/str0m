@@ -36,6 +36,7 @@ pub struct RtcConfig {
     pub(crate) dtls_cert: Option<DtlsCert>,
     pub(crate) fingerprint_verification: bool,
     pub(crate) ice_lite: bool,
+    pub(crate) control_tie_breaker: Option<u64>,
     pub(crate) initial_stun_rto: Option<Duration>,
     pub(crate) max_stun_rto: Option<Duration>,
     pub(crate) max_stun_retransmits: Option<usize>,
@@ -150,6 +151,27 @@ impl RtcConfig {
     pub fn set_ice_lite(mut self, enabled: bool) -> Self {
         self.ice_lite = enabled;
         self
+    }
+
+    /// Sets the ICE role tie breaker used to resolve when both peers claim the
+    /// controlling role.
+    ///
+    /// Per [RFC 8445 section 6.1.1][1] the peer with the higher tie breaker keeps
+    /// the controlling role. The default is a random per-session value. Setting it
+    /// makes role conflict resolution reproducible, which deterministic
+    /// simulation and test harnesses need.
+    ///
+    /// [1]: https://www.rfc-editor.org/rfc/rfc8445#section-6.1.1
+    pub fn set_control_tie_breaker(mut self, tie_breaker: u64) -> Self {
+        self.control_tie_breaker = Some(tie_breaker);
+        self
+    }
+
+    /// The configured ICE role tie breaker, if set via
+    /// [`Self::set_control_tie_breaker()`]. `None` means str0m generates a
+    /// random per-session value.
+    pub fn control_tie_breaker(&self) -> Option<u64> {
+        self.control_tie_breaker
     }
 
     /// Sets the initial STUN retransmission timeout (RTO).
@@ -914,6 +936,7 @@ impl Default for RtcConfig {
             dtls_cert: None,
             fingerprint_verification: true,
             ice_lite: false,
+            control_tie_breaker: None,
             initial_stun_rto: None,
             max_stun_rto: None,
             max_stun_retransmits: None,
@@ -958,6 +981,13 @@ mod tests {
             let config = RtcConfig::new().set_sctp_max_message_size(bytes);
             assert_eq!(config.clone().sctp_max_message_size(), bytes);
         }
+    }
+
+    #[test]
+    fn control_tie_breaker_round_trips() {
+        assert_eq!(RtcConfig::default().control_tie_breaker(), None);
+        let config = RtcConfig::new().set_control_tie_breaker(42);
+        assert_eq!(config.control_tie_breaker(), Some(42));
     }
 
     #[test]

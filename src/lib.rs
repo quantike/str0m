@@ -1266,6 +1266,10 @@ impl Rtc {
             ice.set_max_stun_retransmits(max_stun_retransmits);
         }
 
+        if let Some(tie_breaker) = config.control_tie_breaker {
+            ice.set_control_tie_breaker(tie_breaker);
+        }
+
         ice.set_mtu(mtu.clone());
 
         let dtls_cert = config
