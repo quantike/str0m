@@ -350,7 +350,12 @@ impl Media {
         now: Instant,
         audio_timeout: Option<Duration>,
     ) -> Result<Option<MediaData>, RtcError> {
-        for ((pt, rid), buf) in &mut self.depayloaders {
+        // The emission order is part of the deterministic trace, so the
+        // visit order over same-instant ready buffers follows the key order
+        // rather than HashMap iteration order (see the pacer MidRid fix).
+        let mut buffers: Vec<_> = self.depayloaders.iter_mut().collect();
+        buffers.sort_by_key(|((pt, rid), _)| (*pt, *rid));
+        for ((pt, rid), buf) in buffers {
             if let Some(r) = buf.pop(now, audio_timeout) {
                 let dep = r.map_err(|e| RtcError::Packet(self.mid, *pt, e))?;
                 let Some(codec) = params.iter().find(|c| c.pt() == *pt) else {
@@ -820,7 +825,7 @@ impl Media {
 #[cfg(test)]
 mod receive_timeout_test {
     use super::*;
-    use crate::format::Codec;
+    use crate::format::{Codec, CodecSpec, FormatParams};
     use crate::rtp_::RtpHeader;
 
     fn blocked_buffer(base: Instant) -> DepacketizingBuffer {
@@ -879,5 +884,53 @@ mod receive_timeout_test {
         assert_eq!(media.poll_receive_timeout(None), None);
         media.depayloaders.insert((pt1, rid1), blocked_buffer(base));
         assert_eq!(media.poll_receive_timeout(Some(Duration::ZERO)), Some(base));
+    }
+
+    fn ready_buffer(base: Instant) -> DepacketizingBuffer {
+        let mut buffer = DepacketizingBuffer::new(Codec::Vp8.into(), 30);
+        buffer.push(
+            RtpMeta {
+                received: base,
+                time: MediaTime::from_90khz(3000),
+                seq_no: 1.into(),
+                header: RtpHeader {
+                    marker: true,
+                    ..Default::default()
+                },
+                last_sender_info: None,
+            },
+            [0x10, 0, 0],
+        );
+        buffer
+    }
+
+    /// Two layers holding ready frames in the same poll emit in (pt, rid)
+    /// key order, not HashMap iteration order: the emitted MediaData order
+    /// is part of the deterministic trace.
+    #[test]
+    fn ready_buffers_poll_in_key_order() {
+        let base = Instant::now();
+        let mut media = Media::default();
+        let vp8_spec = CodecSpec {
+            codec: Codec::Vp8,
+            clock_rate: Frequency::NINETY_KHZ,
+            channels: None,
+            format: FormatParams::default(),
+        };
+        let params: [PayloadParams; 1] =
+            [PayloadParams::new(Pt::new_with_value(96), None, vp8_spec)];
+        let pt = params[0].pt();
+
+        // Insert in reverse key order: insertion order must not decide.
+        media.depayloaders.insert((pt, Some("h".into())), ready_buffer(base));
+        media.depayloaders.insert((pt, None), ready_buffer(base));
+
+        let first = media.poll_sample(&params, base, None).unwrap().unwrap();
+        assert_eq!(first.rid, None, "lower key polls first");
+
+        let second = media.poll_sample(&params, base, None).unwrap().unwrap();
+        assert_eq!(second.rid, Some("h".into()), "higher key polls second");
+
+        assert!(media.poll_sample(&params, base, None).unwrap().is_none());
     }
 }
